@@ -1,0 +1,96 @@
+name: Build SerialSpoof
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write sources
+        run: |
+          mkdir -p $(dirname module/module.prop)
+          cat > module/module.prop <<'EOF1'
+          id=serialspoof
+          name=Serial Spoof (Per-App)
+          version=v1.0
+          versionCode=1
+          author=you
+          description=按应用单独修改序列号（需要 Zygisk Next / NeoZygisk）。配置：/data/adb/serialspoof/config.txt
+          EOF1
+          mkdir -p $(dirname module/customize.sh)
+          cat > module/customize.sh <<'EOF2'
+          #!/system/bin/sh
+          CFG=/data/adb/serialspoof
+          mkdir -p $CFG
+          if [ ! -f $CFG/config.txt ]; then
+          cat > $CFG/config.txt <<'EOC'
+          # 格式：包名=序列号   （一行一个应用，# 开头为注释）
+          # com.example.app=ABCDEF123456
+          EOC
+          fi
+          chmod 644 $CFG/config.txt
+          ui_print "- 配置文件: $CFG/config.txt"
+          ui_print "- 需要已安装并启用 Zygisk Next / NeoZygisk"
+          EOF2
+          mkdir -p $(dirname jni/CMakeLists.txt)
+          cat > jni/CMakeLists.txt <<'EOF3'
+          cmake_minimum_required(VERSION 3.18)
+          project(serialspoof CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          add_library(serialspoof SHARED main.cpp)
+          target_link_libraries(serialspoof log)
+          EOF3
+          mkdir -p $(dirname jni/main.cpp)
+          cat > jni/main.cpp <<'EOF4'
+          // Zygisk module: per-app serial spoof. Needs zygisk.hpp (API v4) in this folder.
+          #include <jni.h>
+          #include <unistd.h>
+          #include <string.h>
+          #include <fstream>
+          #include <string>
+          #include <android/log.h>
+          #include "zygisk.hpp"
+
+          #define TAG "SerialSpoof"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+          static const char *CONFIG = "/data/adb/serialspoof/config.txt";
+
+          static int read_full(int fd, void *buf, size_t n) {
+              char *p = (char *)buf;
+              while (n > 0) { ssize_t r = read(fd, p, n); if (r <= 0) return -1; p += r; n -= r; }
+              return 0;
+          }
+
+          // ---------- companion (root 进程，负责读配置) ----------
+          static std::string lookup(const std::string &pkg) {
+              std::ifstream f(CONFIG);
+              std::string line;
+              while (std::getline(f, line)) {
+                  while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                  if (line.empty() || line[0] == '#') continue;
+                  auto eq = line.find('=');
+                  if (eq == std::string::npos) continue;
+                  if (line.substr(0, eq) == pkg) return line.substr(eq + 1);
+              }
+              return "";
+          }
+
+          static void companion_handler(int fd) {
+              uint32_t len = 0;
+              std::string serial;
+              if (read_full(fd, &len, 4) == 0 && len > 0 && len < 256) {
+                  std::string pkg(len, '\0');
+                  if (read_full(fd, &pkg[0], len) == 0) serial = lookup(pkg);
+              }
+              uint32_t n = serial.size();
+              write(fd, &n, 4);
+              if (n) write(fd, serial.data(), n);
+          }
+
+          // ---------- 应用进程内 ----------
+          static std::string g_serial;
+          static jstring (*orig_native_get)(JNIEnv *, jclass, jstring, jstring) = nullptr;
+
+          static jstring my_native_get(JNIEnv *env, jclass clazz, jstring key, jstring def) {
+              if (key && orig_native_get) {
+                  const char *k = env->GetStringUTFChars(key, nullptr);
+                  bool hit = k && (!strcmp(k, "ro.serialno") || !strcmp(k, "ro.boot.serialno") ||
