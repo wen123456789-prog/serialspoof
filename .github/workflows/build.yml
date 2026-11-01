@@ -14,7 +14,7 @@ jobs:
           version=v1.0
           versionCode=1
           author=you
-          description=按应用单独修改序列号（需要 Zygisk Next / NeoZygisk）。配置：/data/adb/serialspoof/config.txt
+          description=Per-app serial spoof. Config: /data/adb/serialspoof/config.txt
           EOF1
           mkdir -p $(dirname module/customize.sh)
           cat > module/customize.sh <<'EOF2'
@@ -23,13 +23,13 @@ jobs:
           mkdir -p $CFG
           if [ ! -f $CFG/config.txt ]; then
           cat > $CFG/config.txt <<'EOC'
-          # 格式：包名=序列号   （一行一个应用，# 开头为注释）
+          # format: package=SERIAL  (one app per line)
           # com.example.app=ABCDEF123456
           EOC
           fi
           chmod 644 $CFG/config.txt
-          ui_print "- 配置文件: $CFG/config.txt"
-          ui_print "- 需要已安装并启用 Zygisk Next / NeoZygisk"
+          ui_print "- config: $CFG/config.txt"
+          ui_print "- needs Zygisk Next / NeoZygisk"
           EOF2
           mkdir -p $(dirname jni/CMakeLists.txt)
           cat > jni/CMakeLists.txt <<'EOF3'
@@ -41,7 +41,6 @@ jobs:
           EOF3
           mkdir -p $(dirname jni/main.cpp)
           cat > jni/main.cpp <<'EOF4'
-          // Zygisk module: per-app serial spoof. Needs zygisk.hpp (API v4) in this folder.
           #include <jni.h>
           #include <unistd.h>
           #include <string.h>
@@ -60,7 +59,6 @@ jobs:
               return 0;
           }
 
-          // ---------- companion (root 进程，负责读配置) ----------
           static std::string lookup(const std::string &pkg) {
               std::ifstream f(CONFIG);
               std::string line;
@@ -85,12 +83,84 @@ jobs:
               write(fd, &n, 4);
               if (n) write(fd, serial.data(), n);
           }
-
-          // ---------- 应用进程内 ----------
-          static std::string g_serial;
+                    static std::string g_serial;
           static jstring (*orig_native_get)(JNIEnv *, jclass, jstring, jstring) = nullptr;
 
           static jstring my_native_get(JNIEnv *env, jclass clazz, jstring key, jstring def) {
               if (key && orig_native_get) {
                   const char *k = env->GetStringUTFChars(key, nullptr);
                   bool hit = k && (!strcmp(k, "ro.serialno") || !strcmp(k, "ro.boot.serialno") ||
+                                   !strcmp(k, "sys.serialno") || !strcmp(k, "vendor.serialno") ||
+                                   !strcmp(k, "persist.sys.serialno"));
+                  if (k) env->ReleaseStringUTFChars(key, k);
+                  if (hit) return env->NewStringUTF(g_serial.c_str());
+              }
+              return orig_native_get ? orig_native_get(env, clazz, key, def) : def;
+          }
+
+          class SerialSpoof : public zygisk::ModuleBase {
+          public:
+              void onLoad(zygisk::Api *api, JNIEnv *env) override { api_ = api; env_ = env; }
+
+              void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+                  const char *nice = env_->GetStringUTFChars(args->nice_name, nullptr);
+                  std::string pkg = nice ? nice : "";
+                  if (nice) env_->ReleaseStringUTFChars(args->nice_name, nice);
+                  auto c = pkg.find(':');
+                  if (c != std::string::npos) pkg.resize(c);
+
+                  int fd = api_->connectCompanion();
+                  if (fd >= 0) {
+                      uint32_t len = pkg.size();
+                      if (write(fd, &len, 4) == 4 && write(fd, pkg.data(), len) == (ssize_t)len) {
+                          uint32_t n = 0;
+                          if (read_full(fd, &n, 4) == 0 && n > 0 && n < 256) {
+                              g_serial.assign(n, '\0');
+                              if (read_full(fd, &g_serial[0], n) != 0) g_serial.clear();
+                          }
+                      }
+                      close(fd);
+                  }
+                  if (g_serial.empty()) api_->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+              }
+
+              void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
+                  if (g_serial.empty()) return;
+                  jclass build = env_->FindClass("android/os/Build");
+                  if (build) {
+                      jfieldID f = env_->GetStaticFieldID(build, "SERIAL", "Ljava/lang/String;");
+                      if (f) env_->SetStaticObjectField(build, f, env_->NewStringUTF(g_serial.c_str()));
+                  }
+                  if (env_->ExceptionCheck()) env_->ExceptionClear();
+                  JNINativeMethod m[] = {{"native_get",
+                      "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *)my_native_get}};
+                  api_->hookJniNativeMethods(env_, "android/os/SystemProperties", m, 1);
+                  orig_native_get = (decltype(orig_native_get))m[0].fnPtr;
+                  LOGI("spoofed serial applied, hook=%p", (void *)orig_native_get);
+              }
+
+          private:
+              zygisk::Api *api_ = nullptr;
+              JNIEnv *env_ = nullptr;
+          };
+
+          REGISTER_ZYGISK_MODULE(SerialSpoof)
+          REGISTER_ZYGISK_COMPANION(companion_handler)
+          EOF4
+          mkdir -p module/zygisk
+      - name: Get zygisk.hpp
+        run: |
+          git clone --depth 1 https://github.com/topjohnwu/zygisk-module-sample /tmp/zs
+          cp "$(find /tmp/zs -name zygisk.hpp | head -n1)" jni/zygisk.hpp
+      - name: Build
+        run: |
+          for abi in arm64-v8a armeabi-v7a; do
+            cmake -S jni -B build/$abi -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
+            cmake --build build/$abi
+            cp build/$abi/libserialspoof.so module/zygisk/$abi.so
+          done
+          cd module && zip -r ../SerialSpoof.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SerialSpoof
+          path: SerialSpoof.zip
